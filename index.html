@@ -1,0 +1,799 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>击鼓传花 · Visual Slice v1</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;overflow:hidden;background:#070312;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB",sans-serif;}
+  #app{position:fixed;inset:0;}
+  canvas{display:block;}
+
+  /* 左下角 UI */
+  #ui{position:fixed;left:20px;bottom:18px;z-index:20;pointer-events:none;
+    color:rgba(196,214,255,.62);text-shadow:0 0 12px rgba(60,120,255,.35);
+    line-height:1.55;user-select:none;}
+  #ui .title{font-size:19px;font-weight:600;letter-spacing:.14em;
+    color:rgba(224,236,255,.9);text-shadow:0 0 16px rgba(120,90,255,.55);}
+  #ui .sub{font-size:11px;letter-spacing:.28em;color:rgba(150,180,255,.5);margin-top:2px;}
+  #ui .hint{font-size:11.5px;letter-spacing:.02em;margin-top:9px;color:rgba(170,196,240,.5);}
+  #ui .hint b{color:rgba(120,225,255,.8);font-weight:600;}
+
+  /* 开始遮罩 */
+  #start{position:fixed;inset:0;z-index:40;display:flex;flex-direction:column;
+    align-items:center;justify-content:center;cursor:pointer;
+    background:radial-gradient(ellipse at 50% 45%,rgba(20,10,45,.55) 0%,rgba(6,3,18,.86) 70%);
+    transition:opacity .9s ease;}
+  #start .brand{font-size:clamp(38px,7vw,74px);font-weight:700;letter-spacing:.2em;
+    color:#eaf1ff;text-shadow:0 0 30px rgba(122,88,255,.7),0 0 70px rgba(255,45,117,.35);}
+  #start .ver{margin-top:10px;font-size:13px;letter-spacing:.5em;
+    color:rgba(150,180,255,.65);text-transform:uppercase;}
+  #start .go{margin-top:38px;font-size:16px;letter-spacing:.34em;padding:13px 30px;
+    border:1px solid rgba(120,220,255,.45);border-radius:40px;color:rgba(210,245,255,.92);
+    box-shadow:0 0 26px rgba(60,190,255,.28),inset 0 0 20px rgba(60,190,255,.12);
+    animation:pulse 1.9s ease-in-out infinite;}
+  #start .tips{margin-top:26px;font-size:12px;letter-spacing:.12em;color:rgba(150,175,220,.5);}
+  @keyframes pulse{0%,100%{opacity:.62;transform:translateY(0)}50%{opacity:1;transform:translateY(-2px)}}
+  #start.hide{opacity:0;pointer-events:none;}
+</style>
+</head>
+<body>
+<div id="app"></div>
+
+<div id="ui">
+  <div class="title">击鼓传花</div>
+  <div class="sub">VISUAL SLICE v1</div>
+  <div class="hint">拖动 <b>看场景</b> &nbsp;·&nbsp; 空格 <b>切换镜头</b></div>
+</div>
+
+<div id="start">
+  <div class="brand">击鼓传花</div>
+  <div class="ver">Visual Slice v1</div>
+  <div class="go">▶ 点击开始</div>
+  <div class="tips">开启合成鼓点 · 拖动看场景 · 空格切换自动 / 手动镜头</div>
+</div>
+
+<!-- three.js r128 UMD + examples/js（经典 script 标签，全局 THREE，兼容 file://） -->
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/CopyShader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/LuminosityHighPassShader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/EffectComposer.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/RenderPass.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/ShaderPass.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/UnrealBloomPass.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+
+<script>
+(function(){
+  "use strict";
+
+  /* ============================ 配置 ============================ */
+  var CFG = {
+    bg:        0x070312,
+    fog:       0x0a0420,
+    fogDensity:0.017,
+    cyan:   0x1fd8ff,   // Mi / 吉他手
+    mag:    0xff2d75,   // Do / 鼓手暖红
+    purple: 0x7d3bff,   // 贝斯手
+    gold:   0xffc24b,   // Sol / 鼓手金
+    red:    0xff3b4e,
+    grid:   0x0b4f74,   // 地面网格（统一冷色）
+    tempo:  120
+  };
+
+  /* ============================ 全局引用 ============================ */
+  var renderer, scene, camera, composer, bloomPass, controls, clock;
+  var gridMat, gridBase, stageRings = [], pillars = [], characters = [];
+  var particles, pPos, pVel, pBaseSpeed, PCOUNT = 360;
+  var rings = [], ringIdx = 0;
+
+  /* 节拍脉冲量（每帧衰减，事件时刻置 1） */
+  var pulse = { kick:0, hat:0, snare:0 };
+
+  /* 镜头 */
+  var autoMode = true;
+  var smoothPos = new THREE.Vector3();
+  var smoothLook = new THREE.Vector3();
+
+  /* 音频 */
+  var audioCtx = null, masterGain = null, noiseBuffer = null;
+  var schedulerTimer = null, current16 = 0, nextNoteTime = 0;
+  var visualQueue = [];
+  var SECONDS_PER_BEAT = 60 / CFG.tempo;      // 0.5s
+  var SECONDS_PER_8TH  = SECONDS_PER_BEAT/2;  // 0.25s（八分音符=调度步长）
+  var LOOKAHEAD = 25;      // ms，仅驱动调度循环，不直接触发音频
+  var SCHEDULE_AHEAD = 0.11;
+
+  /* ============================ 初始化 ============================ */
+  function init(){
+    var el = document.getElementById('app');
+
+    renderer = new THREE.WebGLRenderer({ antialias:true, powerPreference:'high-performance' });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setClearColor(CFG.bg, 1);
+    renderer.toneMapping = THREE.NoToneMapping; // 保留霓虹饱和度，靠 gamma pass 收尾
+    el.appendChild(renderer.domElement);
+
+    scene = new THREE.Scene();
+    scene.fog = new THREE.FogExp2(CFG.fog, CFG.fogDensity);
+
+    camera = new THREE.PerspectiveCamera(52, window.innerWidth/window.innerHeight, 0.1, 400);
+    camera.position.set(0, 6, 36);
+
+    clock = new THREE.Clock();
+
+    buildLights();
+    buildGround();
+    buildStage();
+    buildRipples();
+    buildPillars();
+    buildCharacters();
+    buildParticles();
+    buildBushes();
+
+    setupControls();
+    setupPost();
+
+    // 相机初值播种，避免首帧从原点插值
+    var s0 = directorSample(0);
+    smoothPos.copy(s0.pos); smoothLook.copy(s0.look);
+    camera.position.copy(s0.pos); camera.lookAt(s0.look);
+
+    window.addEventListener('resize', onResize);
+
+    // 交互：拖动接管 / 空格切换
+    controls.addEventListener('start', function(){ autoMode = false; });
+    window.addEventListener('keydown', function(e){
+      if (e.code === 'Space'){ e.preventDefault(); autoMode = !autoMode; }
+    });
+
+    // 开始遮罩
+    var startEl = document.getElementById('start');
+    startEl.addEventListener('click', function(){
+      startAudio();
+      startEl.classList.add('hide');
+      setTimeout(function(){ startEl.style.display = 'none'; }, 950);
+    });
+
+  }
+
+  /* ============================ 灯光 ============================ */
+  function buildLights(){
+    scene.add(new THREE.HemisphereLight(0x2a3566, 0x070312, 0.55));
+    var p1 = new THREE.PointLight(CFG.cyan, 0.7, 90); p1.position.set(2, 12, 14); scene.add(p1);
+    var p2 = new THREE.PointLight(CFG.mag,  0.6, 90); p2.position.set(-16, 9, -10); scene.add(p2);
+    var p3 = new THREE.PointLight(CFG.gold, 0.4, 80); p3.position.set(16, 7, -8); scene.add(p3);
+    var p4 = new THREE.PointLight(CFG.purple,0.4, 80); p4.position.set(0, 6, -18); scene.add(p4);
+  }
+
+  /* ============================ 地面霓虹网格 ============================ */
+  function buildGround(){
+    var size = 160, div = 64, half = size/2, step = size/div;
+    var verts = [];
+    for (var i=0;i<=div;i++){
+      var p = -half + i*step;
+      verts.push(-half,0,p,  half,0,p);
+      verts.push(p,0,-half,  p,0,half);
+    }
+    var geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(verts,3));
+    gridBase = new THREE.Color(CFG.grid);
+    gridMat = new THREE.LineBasicMaterial({ color: gridBase.clone(), transparent:true, opacity:0.9 });
+    var grid = new THREE.LineSegments(geo, gridMat);
+    grid.position.y = 0.0;
+    scene.add(grid);
+
+    // 暗色底板，吃住网格下方避免透视穿帮
+    var floor = new THREE.Mesh(
+      new THREE.PlaneGeometry(size, size),
+      new THREE.MeshStandardMaterial({ color:0x05020f, metalness:0.2, roughness:0.9 })
+    );
+    floor.rotation.x = -Math.PI/2; floor.position.y = -0.05; scene.add(floor);
+  }
+
+  /* ============================ 中央发光舞台 ============================ */
+  function buildStage(){
+    // 主圆盘
+    var disc = new THREE.Mesh(
+      new THREE.CircleGeometry(6.4, 64),
+      new THREE.MeshStandardMaterial({ color:0x0d0726, emissive:CFG.purple, emissiveIntensity:0.25, metalness:0.6, roughness:0.4 })
+    );
+    disc.rotation.x = -Math.PI/2; disc.position.y = 0.02; scene.add(disc);
+
+    // 同心圆纹理（交替冷色）
+    var radii = [1.6, 2.8, 4.0, 5.1, 6.1];
+    for (var i=0;i<radii.length;i++){
+      var col = (i%2===0) ? CFG.cyan : CFG.mag;
+      var seg = 96, arr = [];
+      for (var j=0;j<=seg;j++){
+        var a = j/seg*Math.PI*2;
+        arr.push(Math.cos(a)*radii[i], 0, Math.sin(a)*radii[i]);
+      }
+      var g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.Float32BufferAttribute(arr,3));
+      var m = new THREE.LineBasicMaterial({ color:new THREE.Color(col), transparent:true, opacity:0.85 });
+      var loop = new THREE.Line(g, m);
+      loop.position.y = 0.05;
+      scene.add(loop);
+      stageRings.push({ mat:m, base:new THREE.Color(col) });
+    }
+  }
+
+  /* ============================ 拍点涟漪（kick 触发） ============================ */
+  function buildRipples(){
+    for (var i=0;i<5;i++){
+      var m = new THREE.MeshBasicMaterial({ color:CFG.cyan, transparent:true, opacity:0,
+        blending:THREE.AdditiveBlending, side:THREE.DoubleSide, depthWrite:false });
+      var mesh = new THREE.Mesh(new THREE.RingGeometry(0.92, 1.0, 72), m);
+      mesh.rotation.x = -Math.PI/2; mesh.position.y = 0.07;
+      scene.add(mesh);
+      rings.push({ mesh:mesh, mat:m, life:0 });
+    }
+  }
+  function fireRipple(){
+    var r = rings[ringIdx]; ringIdx = (ringIdx+1)%rings.length; r.life = 1;
+  }
+
+  /* ============================ 音级柱（Do/Mi/Sol） ============================ */
+  function buildPillars(){
+    var defs = [
+      { name:'Do',  color:CFG.red,  angle:Math.PI*1.16, h:8.4  },
+      { name:'Mi',  color:CFG.cyan, angle:Math.PI*0.5,  h:11.6 },
+      { name:'Sol', color:CFG.gold, angle:Math.PI*1.84, h:6.4  }
+    ];
+    var R = 13.5;
+    for (var i=0;i<defs.length;i++){
+      var d = defs[i];
+      var x = Math.cos(d.angle)*R, z = Math.sin(d.angle)*R;
+      var grp = new THREE.Group(); grp.position.set(x, 0, z);
+
+      var mat = new THREE.MeshStandardMaterial({ color:0x0a0a16, emissive:new THREE.Color(d.color),
+        emissiveIntensity:1.0, metalness:0.45, roughness:0.32 });
+      var shaft = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.72, d.h, 6), mat);
+      shaft.position.y = d.h/2; grp.add(shaft);
+
+      // 柱顶发光冠
+      var cap = new THREE.Mesh(new THREE.IcosahedronGeometry(0.6, 0),
+        new THREE.MeshBasicMaterial({ color:d.color }));
+      cap.position.y = d.h + 0.5; grp.add(cap);
+
+      // 基座光环
+      var halo = new THREE.Mesh(new THREE.RingGeometry(0.95, 1.35, 40),
+        new THREE.MeshBasicMaterial({ color:d.color, transparent:true, opacity:0.75,
+          blending:THREE.AdditiveBlending, side:THREE.DoubleSide, depthWrite:false }));
+      halo.rotation.x = -Math.PI/2; halo.position.y = 0.06; grp.add(halo);
+
+      // 悬浮音符 ♪
+      var spr = makeNoteSprite(d.color);
+      spr.position.y = d.h + 2.1; spr.scale.setScalar(2.3); grp.add(spr);
+
+      scene.add(grp);
+      pillars.push({ grp:grp, mat:mat, cap:cap, spr:spr,
+        color:new THREE.Color(d.color), noteY:d.h+2.1, phase:Math.random()*6.28 });
+    }
+  }
+
+  function makeNoteSprite(color){
+    var c = document.createElement('canvas'); c.width = c.height = 128;
+    var x = c.getContext('2d');
+    var col = '#' + new THREE.Color(color).getHexString();
+    x.clearRect(0,0,128,128);
+    x.shadowColor = col; x.shadowBlur = 22;
+    x.fillStyle = col; x.font = 'bold 96px Georgia, "Times New Roman", serif';
+    x.textAlign = 'center'; x.textBaseline = 'middle';
+    x.fillText('♪', 64, 70); x.fillText('♪', 64, 70); // ♪ 叠两遍加亮
+    var tex = new THREE.CanvasTexture(c); tex.needsUpdate = true;
+    var m = new THREE.SpriteMaterial({ map:tex, transparent:true,
+      blending:THREE.AdditiveBlending, depthWrite:false });
+    return new THREE.Sprite(m);
+  }
+
+  /* ============================ 乐器人角色 ============================ */
+  function buildCharacters(){
+    var drummer = buildDrummer();
+    drummer.group.position.set(0, 0.05, -0.6);
+    scene.add(drummer.group);
+    characters.push(Object.assign(drummer, { baseY:0.05, freq:2.9, phase:0.0,  bounce:0 }));
+
+    var guitar = buildStringChar({ color:CFG.cyan, torsoH:2.5, legH:1.05,
+      headGeo:new THREE.OctahedronGeometry(0.5,0), instScale:1.0 });
+    guitar.group.position.set(-4.4, 0.05, 1.2);
+    guitar.group.rotation.y = 0.26;
+    scene.add(guitar.group);
+    characters.push(Object.assign(guitar, { baseY:0.05, freq:2.4, phase:2.1, bounce:0 }));
+
+    var bass = buildStringChar({ color:CFG.purple, torsoH:2.0, legH:0.95,
+      headGeo:new THREE.DodecahedronGeometry(0.56,0), instScale:1.4 });
+    bass.group.position.set(4.4, 0.05, 1.0);
+    bass.group.rotation.y = -0.26;
+    scene.add(bass.group);
+    characters.push(Object.assign(bass, { baseY:0.05, freq:2.05, phase:4.0, bounce:0 }));
+  }
+
+  function makeHalo(color, r){
+    var m = new THREE.Mesh(new THREE.RingGeometry(r*0.8, r, 36),
+      new THREE.MeshBasicMaterial({ color:color, transparent:true, opacity:0.8,
+        blending:THREE.AdditiveBlending, side:THREE.DoubleSide, depthWrite:false }));
+    m.rotation.x = -Math.PI/2; m.position.y = 0.02; return m;
+  }
+
+  // 鼓手：矮壮，躯干=侧放大鼓，手臂末端鼓槌，红金
+  function buildDrummer(){
+    var g = new THREE.Group();
+    var shell = new THREE.MeshStandardMaterial({ color:0x2a0410, emissive:CFG.red,
+      emissiveIntensity:0.62, metalness:0.5, roughness:0.3 });
+    var gold  = new THREE.MeshBasicMaterial({ color:CFG.gold });
+    var goldStd= new THREE.MeshStandardMaterial({ color:0x1a0d02, emissive:CFG.gold,
+      emissiveIntensity:0.92, metalness:0.4, roughness:0.35 });
+
+    // 侧放大鼓（轴向 X）
+    var drum = new THREE.Mesh(new THREE.CylinderGeometry(1.05, 1.05, 1.7, 24), shell);
+    drum.rotation.z = Math.PI/2; drum.position.y = 1.55; g.add(drum);
+    // 两侧发光鼓面
+    [-0.87, 0.87].forEach(function(sx){
+      var head = new THREE.Mesh(new THREE.CircleGeometry(1.03, 24), gold);
+      head.position.set(sx, 1.55, 0);
+      head.rotation.y = sx < 0 ? -Math.PI/2 : Math.PI/2;
+      g.add(head);
+    });
+    // 鼓身箍
+    var hoop = new THREE.Mesh(new THREE.TorusGeometry(1.06, 0.07, 8, 28),
+      new THREE.MeshBasicMaterial({ color:CFG.gold }));
+    hoop.rotation.y = Math.PI/2; hoop.position.y = 1.55; g.add(hoop);
+
+    // 短腿
+    [-0.5, 0.5].forEach(function(x){
+      var leg = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.18, 0.7, 8), shell);
+      leg.position.set(x, 0.35, 0); g.add(leg);
+    });
+
+    // 头（发光 Icosa）+ 短颈
+    var neck = new THREE.Mesh(new THREE.CylinderGeometry(0.16,0.2,0.5,8), shell);
+    neck.position.y = 2.55; g.add(neck);
+    var head = new THREE.Mesh(new THREE.IcosahedronGeometry(0.58,0), goldStd);
+    head.position.y = 3.15; g.add(head);
+
+    // 手臂 + 鼓槌（放进 sticks 组，随拍摆动）
+    var sticks = new THREE.Group(); sticks.position.set(0, 2.35, 0.2);
+    [-1, 1].forEach(function(side){
+      var arm = new THREE.Group(); arm.position.set(side*0.55, 0, 0);
+      var upper = new THREE.Mesh(new THREE.CylinderGeometry(0.1,0.1,0.9,6), shell);
+      upper.position.set(side*0.15, -0.25, 0.2); upper.rotation.x = 0.7; upper.rotation.z = -side*0.3;
+      arm.add(upper);
+      var stick = new THREE.Mesh(new THREE.CylinderGeometry(0.05,0.07,0.95,6),
+        new THREE.MeshStandardMaterial({ color:0x201008, emissive:CFG.gold, emissiveIntensity:0.6, roughness:0.6 }));
+      stick.position.set(side*0.28, -0.55, 0.7); stick.rotation.x = 1.15;
+      arm.add(stick);
+      var tip = new THREE.Mesh(new THREE.SphereGeometry(0.1,10,8), gold);
+      tip.position.set(side*0.34, -0.9, 1.05); arm.add(tip);
+      sticks.add(arm);
+    });
+    g.add(sticks);
+
+    g.add(makeHalo(CFG.gold, 1.6));
+    return { group:g, head:head, instrument:sticks, sticks:sticks };
+  }
+
+  // 吉他手 / 贝斯手：修长/中等躯干 + 斜持琴体
+  function buildStringChar(cfg){
+    var g = new THREE.Group();
+    var body = new THREE.MeshStandardMaterial({ color:0x0c0618, emissive:new THREE.Color(cfg.color),
+      emissiveIntensity:0.62, metalness:0.45, roughness:0.35 });
+    var headMat = new THREE.MeshStandardMaterial({ color:0x0c0618, emissive:new THREE.Color(cfg.color),
+      emissiveIntensity:0.92, metalness:0.3, roughness:0.4 });
+
+    // 躯干（锥形圆柱）
+    var torso = new THREE.Mesh(new THREE.CylinderGeometry(0.42, 0.6, cfg.torsoH, 10), body);
+    torso.position.y = cfg.legH + cfg.torsoH/2; g.add(torso);
+    // 双腿
+    [-0.26, 0.26].forEach(function(x){
+      var leg = new THREE.Mesh(new THREE.CylinderGeometry(0.17, 0.13, cfg.legH, 8), body);
+      leg.position.set(x, cfg.legH/2, 0); g.add(leg);
+    });
+    // 头
+    var head = new THREE.Mesh(cfg.headGeo, headMat);
+    head.position.y = cfg.legH + cfg.torsoH + 0.52; g.add(head);
+
+    // 乐器（斜挎胸前）
+    var inst = buildInstrument(cfg.color, cfg.instScale);
+    inst.position.set(0.15, cfg.legH + cfg.torsoH*0.42, 0.6);
+    inst.rotation.set(-0.12, 0, -0.52);
+    g.add(inst);
+
+    // 双臂（搭向琴体）
+    var shoulderY = cfg.legH + cfg.torsoH - 0.15;
+    var armMat = body;
+    var aL = new THREE.Mesh(new THREE.CylinderGeometry(0.11,0.09,1.05,6), armMat);
+    aL.position.set(-0.42, shoulderY-0.35, 0.35); aL.rotation.set(0.6,0,0.5); g.add(aL);
+    var aR = new THREE.Mesh(new THREE.CylinderGeometry(0.11,0.09,0.95,6), armMat);
+    aR.position.set(0.5, shoulderY-0.5, 0.4); aR.rotation.set(0.9,0,-0.35); g.add(aR);
+
+    g.add(makeHalo(cfg.color, 1.15));
+    return { group:g, head:head, instrument:inst };
+  }
+
+  function buildInstrument(color, s){
+    var grp = new THREE.Group();
+    var emis = new THREE.MeshStandardMaterial({ color:0x080410, emissive:new THREE.Color(color),
+      emissiveIntensity:0.72, metalness:0.5, roughness:0.3 });
+    var glow = new THREE.MeshBasicMaterial({ color:color });
+
+    // 琴体（压扁的球，贝斯更大更厚）
+    var bodyMesh = new THREE.Mesh(new THREE.SphereGeometry(0.55*s, 18, 14), emis);
+    bodyMesh.scale.set(1.0, 1.28, 0.34 + (s-1)*0.12); grp.add(bodyMesh);
+    // 琴颈
+    var neck = new THREE.Mesh(new THREE.BoxGeometry(0.13*s, 1.75*s, 0.14*s), emis);
+    neck.position.y = 1.15*s; grp.add(neck);
+    // 琴头
+    var hs = new THREE.Mesh(new THREE.BoxGeometry(0.28*s, 0.36*s, 0.16*s), glow);
+    hs.position.y = 2.05*s; grp.add(hs);
+    // 高光弦
+    var str = new THREE.Mesh(new THREE.BoxGeometry(0.03, 1.95*s, 0.03),
+      new THREE.MeshBasicMaterial({ color:0xffffff }));
+    str.position.set(0, 1.0*s, 0.1*s); grp.add(str);
+    // 拾音点
+    var dot = new THREE.Mesh(new THREE.CircleGeometry(0.17*s, 18), glow);
+    dot.position.set(0, 0, 0.2*s + (s-1)*0.06); grp.add(dot);
+    return grp;
+  }
+
+  /* ============================ 漂浮萤火粒子 ============================ */
+  function buildParticles(){
+    var geo = new THREE.BufferGeometry();
+    pPos = new Float32Array(PCOUNT*3);
+    pVel = new Float32Array(PCOUNT*3);
+    pBaseSpeed = new Float32Array(PCOUNT);
+    var colors = new Float32Array(PCOUNT*3);
+    var pal = [new THREE.Color(CFG.cyan), new THREE.Color(CFG.mag),
+              new THREE.Color(CFG.gold), new THREE.Color(CFG.purple)];
+    var weight = [0.42, 0.30, 0.13, 0.15];
+    for (var i=0;i<PCOUNT;i++){
+      var r = 4 + Math.random()*44, a = Math.random()*Math.PI*2;
+      pPos[i*3]   = Math.cos(a)*r;
+      pPos[i*3+1] = Math.random()*24;
+      pPos[i*3+2] = Math.sin(a)*r;
+      pVel[i*3]   = (Math.random()-0.5)*0.12;
+      pVel[i*3+1] = 0.25 + Math.random()*0.5;
+      pVel[i*3+2] = (Math.random()-0.5)*0.12;
+      pBaseSpeed[i] = pVel[i*3+1];
+      // 加权取色
+      var rnd = Math.random(), acc = 0, ci = 0;
+      for (var k=0;k<weight.length;k++){ acc += weight[k]; if (rnd<=acc){ ci=k; break; } }
+      colors[i*3]=pal[ci].r; colors[i*3+1]=pal[ci].g; colors[i*3+2]=pal[ci].b;
+    }
+    geo.setAttribute('position', new THREE.BufferAttribute(pPos,3));
+    geo.setAttribute('color', new THREE.BufferAttribute(colors,3));
+
+    var tex = makeDotTexture();
+    var mat = new THREE.PointsMaterial({ size:0.62, map:tex, vertexColors:true,
+      transparent:true, blending:THREE.AdditiveBlending, depthWrite:false, sizeAttenuation:true });
+    particles = new THREE.Points(geo, mat);
+    scene.add(particles);
+  }
+
+  function makeDotTexture(){
+    var c = document.createElement('canvas'); c.width = c.height = 64;
+    var x = c.getContext('2d');
+    var grad = x.createRadialGradient(32,32,0, 32,32,32);
+    grad.addColorStop(0,'rgba(255,255,255,1)');
+    grad.addColorStop(0.35,'rgba(255,255,255,0.55)');
+    grad.addColorStop(1,'rgba(255,255,255,0)');
+    x.fillStyle = grad; x.fillRect(0,0,64,64);
+    var t = new THREE.CanvasTexture(c); t.needsUpdate = true; return t;
+  }
+
+  /* ============================ Low-poly 草丛 ============================ */
+  function buildBushes(){
+    var mat = new THREE.MeshStandardMaterial({ color:0x071c2e, emissive:0x0a3a52,
+      emissiveIntensity:0.5, flatShading:true, metalness:0.1, roughness:0.95 });
+    var accent = new THREE.MeshStandardMaterial({ color:0x0a1e34, emissive:CFG.cyan,
+      emissiveIntensity:0.34, flatShading:true, roughness:0.9 });
+    for (var i=0;i<16;i++){
+      var a = Math.random()*Math.PI*2;
+      var r = 9 + Math.random()*22;
+      var cx = Math.cos(a)*r, cz = Math.sin(a)*r;
+      var clump = new THREE.Group();
+      var n = 3 + Math.floor(Math.random()*3);
+      for (var j=0;j<n;j++){
+        var sc = 0.5 + Math.random()*0.9;
+        var m = new THREE.Mesh(new THREE.IcosahedronGeometry(sc, 0), (Math.random()<0.25?accent:mat));
+        m.position.set((Math.random()-0.5)*1.6, sc*0.7, (Math.random()-0.5)*1.6);
+        m.rotation.set(Math.random(), Math.random(), Math.random());
+        clump.add(m);
+      }
+      clump.position.set(cx, 0, cz);
+      scene.add(clump);
+    }
+  }
+
+  /* ============================ 后期（Bloom + Gamma） ============================ */
+  function setupPost(){
+    composer = new THREE.EffectComposer(renderer);
+    composer.addPass(new THREE.RenderPass(scene, camera));
+
+    bloomPass = new THREE.UnrealBloomPass(
+      new THREE.Vector2(window.innerWidth, window.innerHeight), 0.72, 0.55, 0.27);
+    composer.addPass(bloomPass);
+
+    // 线性渲染 -> sRGB 显示（内联 gamma pass，免再引 CDN 文件）
+    var GammaShader = {
+      uniforms:{ tDiffuse:{ value:null } },
+      vertexShader:'varying vec2 vUv; void main(){ vUv=uv; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0); }',
+      fragmentShader:'uniform sampler2D tDiffuse; varying vec2 vUv; void main(){ vec4 c=texture2D(tDiffuse,vUv); gl_FragColor=vec4(pow(c.rgb, vec3(0.4545)), c.a); }'
+    };
+    var gammaPass = new THREE.ShaderPass(GammaShader);
+    gammaPass.renderToScreen = true;
+    composer.addPass(gammaPass);
+  }
+
+  /* ============================ 轨道控制 ============================ */
+  function setupControls(){
+    controls = new THREE.OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
+    controls.enablePan = false;
+    controls.minDistance = 6;
+    controls.maxDistance = 90;
+    controls.maxPolarAngle = Math.PI*0.495; // 不钻到地面下
+    controls.target.set(0, 3, 0);
+    controls.update();
+  }
+
+  /* ============================ 自动导演运镜 ============================
+     恒速缓慢环绕 + 关键帧缓动切换 半径/高度/目标，
+     依次呈现：低角环绕 -> 缓推特写 -> 拉升俯瞰 -> 平滑回环 */
+  var KF = [
+    { r:36, h:6.0,  tgt:[0,3.0,0]   },  // 低角度环绕全场
+    { r:14, h:4.5,  tgt:[0,3.2,1.4] },  // 缓推至角色特写
+    { r:11, h:7.5,  tgt:[0,3.6,0]   },  // 近距缓弧
+    { r:16, h:36,   tgt:[0,1.0,0]   },  // 拉升俯瞰
+    { r:30, h:16,   tgt:[0,3.0,0]   }   // 拉回高位，回环
+  ];
+  var KF_DUR = 8.5, ORBIT_RATE = 0.11;
+  function directorSample(t){
+    var total = KF.length*KF_DUR;
+    var lt = ((t % total) + total) % total;
+    var idx = Math.floor(lt/KF_DUR);
+    var f = (lt - idx*KF_DUR)/KF_DUR;
+    f = f*f*(3-2*f); // smoothstep
+    var a = KF[idx], b = KF[(idx+1)%KF.length];
+    var r = a.r + (b.r-a.r)*f;
+    var h = a.h + (b.h-a.h)*f;
+    var tx = a.tgt[0]+(b.tgt[0]-a.tgt[0])*f;
+    var ty = a.tgt[1]+(b.tgt[1]-a.tgt[1])*f;
+    var tz = a.tgt[2]+(b.tgt[2]-a.tgt[2])*f;
+    var theta = t*ORBIT_RATE;
+    return {
+      pos: new THREE.Vector3(tx + Math.cos(theta)*r, h, tz + Math.sin(theta)*r),
+      look: new THREE.Vector3(tx, ty, tz)
+    };
+  }
+
+  /* ============================ 音频：前瞻调度器 ============================ */
+  function startAudio(){
+    if (audioCtx){ if (audioCtx.state==='suspended') audioCtx.resume(); return; }
+    var AC = window.AudioContext || window.webkitAudioContext;
+    audioCtx = new AC();
+
+    masterGain = audioCtx.createGain(); masterGain.gain.value = 0.72;
+    var comp = audioCtx.createDynamicsCompressor();
+    masterGain.connect(comp); comp.connect(audioCtx.destination);
+
+    var len = audioCtx.sampleRate; // 1s 白噪声
+    noiseBuffer = audioCtx.createBuffer(1, len, audioCtx.sampleRate);
+    var nd = noiseBuffer.getChannelData(0);
+    for (var i=0;i<len;i++) nd[i] = Math.random()*2-1;
+
+    current16 = 0;
+    nextNoteTime = audioCtx.currentTime + 0.12;
+    schedulerTimer = setInterval(schedulerTick, LOOKAHEAD);
+  }
+
+  // 仅推进调度，不在此直接发声；真正发声用 osc.start(精确时间)
+  function schedulerTick(){
+    while (nextNoteTime < audioCtx.currentTime + SCHEDULE_AHEAD){
+      scheduleStep(current16, nextNoteTime);
+      nextNoteTime += SECONDS_PER_8TH;
+      current16 = (current16+1) % 8; // 每小节 8 个八分音符
+    }
+  }
+
+  // step: 0..7（八分）。kick 四拍(0,2,4,6) / hi-hat 每八分 / snare 反拍(2,6)
+  function scheduleStep(step, t){
+    synthHat(t, (step%2===0)?0.28:0.16);
+    visualQueue.push({ t:t, type:'hat' });
+    if (step%2===0){
+      synthKick(t);
+      visualQueue.push({ t:t, type:'kick', beat: step/2 }); // beat 0..3
+    }
+    if (step===2 || step===6){
+      synthSnare(t);
+      visualQueue.push({ t:t, type:'snare' });
+    }
+  }
+
+  function synthKick(t){
+    var o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(155, t);
+    o.frequency.exponentialRampToValueAtTime(46, t+0.13);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(1.0, t+0.005);
+    g.gain.exponentialRampToValueAtTime(0.0001, t+0.34);
+    o.connect(g); g.connect(masterGain);
+    o.start(t); o.stop(t+0.36);
+  }
+  function synthHat(t, amp){
+    var src = audioCtx.createBufferSource(); src.buffer = noiseBuffer;
+    var hp = audioCtx.createBiquadFilter(); hp.type='highpass'; hp.frequency.value=7200;
+    var g = audioCtx.createGain();
+    g.gain.setValueAtTime(amp, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t+0.05);
+    src.connect(hp); hp.connect(g); g.connect(masterGain);
+    src.start(t); src.stop(t+0.06);
+  }
+  function synthSnare(t){
+    var src = audioCtx.createBufferSource(); src.buffer = noiseBuffer;
+    var bp = audioCtx.createBiquadFilter(); bp.type='bandpass'; bp.frequency.value=1900; bp.Q.value=0.8;
+    var g = audioCtx.createGain();
+    g.gain.setValueAtTime(0.42, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t+0.18);
+    src.connect(bp); bp.connect(g); g.connect(masterGain);
+    src.start(t); src.stop(t+0.2);
+    var o = audioCtx.createOscillator(), g2 = audioCtx.createGain();
+    o.type='triangle';
+    o.frequency.setValueAtTime(330,t); o.frequency.exponentialRampToValueAtTime(180,t+0.1);
+    g2.gain.setValueAtTime(0.26,t); g2.gain.exponentialRampToValueAtTime(0.0001,t+0.12);
+    o.connect(g2); g2.connect(masterGain); o.start(t); o.stop(t+0.13);
+  }
+
+  /* 消费视觉节拍事件：与音频同源（AudioContext.currentTime） */
+  function consumeBeats(){
+    if (!audioCtx) return;
+    var now = audioCtx.currentTime;
+    while (visualQueue.length && visualQueue[0].t <= now){
+      var e = visualQueue.shift();
+      if (e.type==='kick'){ pulse.kick = 1; onKick(e.beat); }
+      else if (e.type==='hat'){ pulse.hat = 1; }
+      else if (e.type==='snare'){ pulse.snare = 1; }
+    }
+  }
+  function onKick(beat){
+    fireRipple();
+    characters[0].bounce = 1;                         // 鼓手每拍弹
+    if (beat===0 || beat===2) characters[2].bounce = 1; // 贝斯手正拍
+    if (beat===1 || beat===3) characters[1].bounce = 1; // 吉他手反拍
+  }
+
+  /* ============================ 主循环 ============================ */
+  var lastW = 0, lastH = 0;
+  function animate(){
+    requestAnimationFrame(animate);
+    // 尺寸自愈：无论初始视口是否为 0，都保证画布贴合窗口
+    if (window.innerWidth > 0 && (window.innerWidth !== lastW || window.innerHeight !== lastH)){
+      lastW = window.innerWidth; lastH = window.innerHeight; onResize();
+    }
+    var dt = Math.min(clock.getDelta(), 0.05);
+    var t = clock.elapsedTime;
+
+    consumeBeats();
+    // 脉冲指数衰减
+    pulse.kick  *= Math.exp(-dt*5.5);
+    pulse.hat   *= Math.exp(-dt*12);
+    pulse.snare *= Math.exp(-dt*6.5);
+
+    updateScene(dt, t);
+    updateCamera(dt, t);
+
+    composer.render();
+  }
+
+  function updateScene(dt, t){
+    // 网格随 kick 提亮脉冲
+    if (gridMat){
+      var gb = 1 + pulse.kick*1.7 + pulse.hat*0.25;
+      gridMat.color.copy(gridBase).multiplyScalar(gb);
+      gridMat.opacity = 0.55 + pulse.kick*0.4;
+    }
+    // 同心圆脉冲
+    for (var i=0;i<stageRings.length;i++){
+      var sr = stageRings[i];
+      sr.mat.color.copy(sr.base).multiplyScalar(1 + pulse.kick*1.3 + pulse.snare*0.5);
+    }
+    // 涟漪扩散
+    for (var r=0;r<rings.length;r++){
+      var ro = rings[r];
+      if (ro.life > 0){
+        ro.life -= dt/0.9;
+        var pr = 1 - Math.max(ro.life,0);
+        var s = 1 + pr*24;
+        ro.mesh.scale.set(s,s,s);
+        ro.mat.opacity = Math.max(ro.life,0)*0.55;
+      } else {
+        ro.mat.opacity = 0;
+      }
+    }
+    // 音级柱辉光 + 音符浮动
+    for (var p=0;p<pillars.length;p++){
+      var pl = pillars[p];
+      pl.mat.emissiveIntensity = 1.0*(1 + pulse.kick*0.9 + pulse.snare*0.45);
+      var bob = Math.sin(t*1.4 + pl.phase)*0.28;
+      pl.spr.position.y = pl.noteY + bob;
+      var sc = 2.3*(1 + pulse.kick*0.16);
+      pl.spr.scale.setScalar(sc);
+      pl.cap.scale.setScalar(1 + pulse.kick*0.22);
+    }
+    // 角色 idle + 拍点弹跳
+    for (var c=0;c<characters.length;c++){
+      var ch = characters[c];
+      ch.bounce *= Math.exp(-dt*6.5);
+      var g = ch.group;
+      var sway = Math.sin(t*ch.freq + ch.phase)*0.12;
+      g.position.y = ch.baseY + sway + ch.bounce*0.55;
+      g.rotation.z = Math.sin(t*ch.freq*0.6 + ch.phase)*0.05;
+      // 挤压拉伸
+      var sy = 1 + ch.bounce*0.12, sxz = 1 - ch.bounce*0.07;
+      g.scale.set(sxz, sy, sxz);
+      // 头部额外点头
+      if (ch.head) ch.head.position.y += 0; // 头随组一起动，保留钩子
+      // 乐器微动
+      if (ch.sticks){ // 鼓手鼓槌敲击
+        ch.sticks.rotation.x = -0.15 - ch.bounce*0.7 + Math.sin(t*4)*0.05;
+      } else if (ch.instrument){
+        ch.instrument.rotation.z = -0.52 + Math.sin(t*ch.freq + ch.phase)*0.06 + ch.bounce*0.08;
+      }
+    }
+    // 粒子上浮 + 拍点微加速
+    if (particles){
+      var speed = 1 + pulse.kick*1.8 + pulse.hat*0.4;
+      var attr = particles.geometry.attributes.position;
+      for (var i2=0;i2<PCOUNT;i2++){
+        var iy = i2*3+1;
+        pPos[i2*3]   += pVel[i2*3]*dt;
+        pPos[iy]     += pBaseSpeed[i2]*speed*dt;
+        pPos[i2*3+2] += pVel[i2*3+2]*dt;
+        if (pPos[iy] > 24){ pPos[iy] = 0; }
+        // 轻微横向漂移回摆
+        pPos[i2*3]   += Math.sin(t*0.5 + i2)*0.002;
+      }
+      attr.needsUpdate = true;
+      particles.rotation.y = t*0.01;
+    }
+    // Bloom 整体随 kick 轻呼吸
+    if (bloomPass) bloomPass.strength = 0.72 + pulse.kick*0.28;
+  }
+
+  function updateCamera(dt, t){
+    if (autoMode){
+      var s = directorSample(t);
+      var k = 1 - Math.exp(-dt*1.9);
+      smoothPos.lerp(s.pos, k);
+      smoothLook.lerp(s.look, k);
+      camera.position.copy(smoothPos);
+      camera.lookAt(smoothLook);
+      controls.target.copy(smoothLook); // 与手动无缝交接
+    } else {
+      controls.update();
+      smoothPos.copy(camera.position);
+      smoothLook.copy(controls.target);
+    }
+  }
+
+  function onResize(){
+    var w = window.innerWidth, h = window.innerHeight;
+    camera.aspect = w/h; camera.updateProjectionMatrix();
+    renderer.setSize(w, h);
+    composer.setSize(w, h);
+    if (bloomPass) bloomPass.setSize(w, h);
+  }
+
+  /* ============================ 启动（放在末尾，确保所有 var 已赋值） ============================ */
+  init();
+  animate();
+
+})();
+</script>
+</body>
+</html>
